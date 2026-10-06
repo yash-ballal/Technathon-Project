@@ -18,6 +18,7 @@ import {
   statusMeta,
   evidenceText,
   reportFromReview,
+  isUnsupported,
 } from './clinicalReview';
 import {
   ROLES,
@@ -26,6 +27,7 @@ import {
   can,
   canPrescribe,
   canViewAuditLog,
+  checkAccess,
   attributeToAuthor,
   doctorSuggestionState,
 } from './roles';
@@ -56,10 +58,15 @@ import {
   describeEvent as describeTimelineEvent,
   provenanceSummary,
   attentionItems,
+  detectHistoryRewrite,
 } from './clinicalTimeline';
 import './App.css';
 
 gsap.registerPlugin(ScrollTrigger);
+
+// The audit log is persisted so history survives a reload (spec: append-oriented
+// accountability record, not a per-session console).
+const AUDIT_STORAGE_KEY = 'arogyalekh_audit_log';
 
 export default function App() {
   // Navigation & View States
@@ -91,6 +98,7 @@ export default function App() {
   const [isRecording, setIsRecording] = useState(false);
   const [report, setReport] = useState(null);
   const [loadingAI, setLoadingAI] = useState(false);
+  const [aiError, setAiError] = useState("");
 
   // New Case Workflow States
   const [caseStep, setCaseStep] = useState(1); // 1: Input, 2: AI Review, 3: Prescription, 4: Approve
@@ -109,6 +117,13 @@ export default function App() {
   const [reviewEvents, setReviewEvents] = useState([]);
   const [caseStartedAt, setCaseStartedAt] = useState("");
   const [expandedTimelineCase, setExpandedTimelineCase] = useState(null);
+  // Add-missing-information inputs on the review screen
+  const [newFactField, setNewFactField] = useState("");
+  const [newFactValue, setNewFactValue] = useState("");
+  // Doctor-authored prescriptions for the current encounter
+  const [rxDrug, setRxDrug] = useState("");
+  const [rxDose, setRxDose] = useState("");
+  const [authorisedPrescriptions, setAuthorisedPrescriptions] = useState([]);
 
   // Enhanced Patient Registration States
   const [newPatientName, setNewPatientName] = useState("");
@@ -166,7 +181,10 @@ export default function App() {
   // Declared before the synchronisation helpers below, which call it. Placing it after
   // them left `addAuditEvent` in its temporal dead zone during render, which threw and
   // rendered a blank page.
-  const addAuditEvent = useCallback((action, details = "", level = "info", changes = []) => {
+  // Signature: (action, details, level, changes, context)
+  //   changes: [{ field, from, to }]  — field-level edits, shown in the audit detail view
+  //   context: { patientId, caseId }  — the "to which patient/case" half of the record
+  const addAuditEvent = useCallback((action, details = "", level = "info", changes = [], context = {}) => {
     const entry = {
       timestamp: new Date().toISOString(),
       actor: authEmail || "Field Worker",
@@ -175,15 +193,80 @@ export default function App() {
       details,
       level, // info | warn | error | success
       changes: Array.isArray(changes) ? changes : [],
+      patientId: context?.patientId ?? "",
+      caseId: context?.caseId ?? "",
     };
     // Append-only, hash-chained: history cannot be rewritten in place, and verifyLog()
     // reports exactly where any edit or removal happened.
     setAuditLog((prev) => {
       const next = appendEntry(prev, entry);
       setAuditIntegrity(verifyLog(next));
+      try {
+        localStorage.setItem(AUDIT_STORAGE_KEY, JSON.stringify(next));
+      } catch {
+        // Storage unavailable or full: the log still works for this session.
+      }
       return next;
     });
   }, [authEmail, currentRole]);
+
+  /**
+   * Enforce a permission and record the refusal.
+   * Spec: the audit log must record unauthorised access attempts.
+   */
+  // Pure: safe to call during render. It must NOT call setState, or rendering a view
+  // the role cannot see would trigger an infinite re-render loop.
+  const requireAccess = useCallback((permission) => checkAccess(currentRole, permission).allowed, [currentRole]);
+
+  /**
+   * Report a refused access attempt.
+   *
+   * Called from an effect (never during render) so recording the denial cannot cause a
+   * render loop, while the attempt is still captured in the audit log.
+   */
+  const recordDeniedAccess = useCallback((permission, what, context = {}) => {
+    const decision = checkAccess(currentRole, permission);
+    addAuditEvent("ACCESS_DENIED", `${what}: ${decision.reason}`, "error", [], context);
+    showToast(decision.reason, "error");
+  }, [currentRole, addAuditEvent]);
+
+  // ==========================================
+  // CASE TIMELINE HELPERS
+  // ==========================================
+  // Declared before the synchronisation helpers below, which append a SYNCHRONISED
+  // event to a case. Placing them after would leave appendCaseEvent in its temporal
+  // dead zone during render and throw a blank page.
+  /**
+   * Refuse to persist a timeline whose history was altered.
+   * Spec: "The timeline should not allow users to silently modify historical events."
+   */
+  const guardTimelineRewrite = useCallback((originalEvents, nextEvents) => {
+    const verdict = detectHistoryRewrite(originalEvents || [], nextEvents || []);
+    if (verdict.tampered) {
+      addAuditEvent("TIMELINE_REWRITE_BLOCKED", verdict.reason, "error");
+      showToast("History cannot be modified: " + verdict.reason, "error");
+      return false;
+    }
+    return true;
+  }, [addAuditEvent]);
+
+  /**
+   * Append an event to an already-saved case's timeline.
+   *
+   * The timeline is append-only: adding to it is allowed, rewriting it is not (see
+   * guardTimelineRewrite). Used for actions that happen after a case is signed.
+   */
+  const appendCaseEvent = useCallback((caseId, event) => {
+    setCases((prev) => prev.map((entry) => {
+      if (entry.id !== caseId) return entry;
+      const existing = Array.isArray(entry.details?.timeline) ? entry.details.timeline : [];
+      const nextTimeline = [...existing, event];
+      // Append-only: the guard refuses if saving this would alter or drop any event
+      // already on record (spec: history must not be silently modifiable).
+      if (!guardTimelineRewrite(existing, nextTimeline)) return entry;
+      return { ...entry, details: { ...entry.details, timeline: nextTimeline } };
+    }));
+  }, [guardTimelineRewrite]);
 
   // ==========================================
   // OFFLINE DETECTION + REAL SYNCHRONISATION
@@ -206,8 +289,26 @@ export default function App() {
       const result = await flushQueue(queue, sendQueuedOperation, { online: navigator.onLine });
       setSyncQueue(result.queue);
       if (result.synced.length > 0) {
-        addAuditEvent("SYNC_COMPLETED", `${result.synced.length} record(s) uploaded (${reason})`, "success");
+        addAuditEvent("SYNC_COMPLETED", `${result.synced.length} record(s) uploaded (${reason})`, "success", [], {});
         showToast(`${result.synced.length} record(s) synchronised.`, "success");
+        // Spec: synchronisation is part of the case timeline. Each flushed operation's
+        // record carries its case, so the event can be attached where it belongs.
+        (queue || []).forEach((operation) => {
+          if (!result.synced.includes(operationKey(operation))) return;
+          const caseId = operation?.record?.case_id;
+          if (operation?.table === 'cases' && caseId) {
+            appendCaseEvent(caseId, makeEvent(EVENT_TYPES.SYNCHRONISED, {
+              actor: 'System',
+              timestamp: new Date().toISOString(),
+              caseId,
+              patientId: operation.record.patient_id,
+              details: `Uploaded to the server (${reason})`,
+            }));
+          }
+          // A case created offline has no id until the server assigns one, so it has no
+          // timeline yet to attach to. Its upload is still recorded in the audit log
+          // above, which is where that sync event is visible.
+        });
       }
       if (result.stopped && result.reason && result.reason !== "offline" && result.synced.length === 0) {
         setSyncError(result.reason);
@@ -217,7 +318,7 @@ export default function App() {
     } finally {
       setSyncBusy(false);
     }
-  }, [addAuditEvent, sendQueuedOperation]);
+  }, [addAuditEvent, sendQueuedOperation, appendCaseEvent]);
 
   // Keep a ref so the online listener always flushes the current queue without
   // re-registering listeners on every queue change.
@@ -292,6 +393,31 @@ export default function App() {
 
   useEffect(() => {
     fetchPatients();
+  }, []);
+
+  // Restore the persisted audit log and re-verify its hash chain on load.
+  useEffect(() => {
+    try {
+      const stored = localStorage.getItem(AUDIT_STORAGE_KEY);
+      if (!stored) return;
+      const parsed = JSON.parse(stored);
+      if (!Array.isArray(parsed) || parsed.length === 0) return;
+      setAuditLog(parsed);
+      const integrity = verifyLog(parsed);
+      setAuditIntegrity(integrity);
+      if (!integrity.valid) {
+        // Surface tampering loudly rather than quietly loading a broken log.
+        setAuditLog((prev) => appendEntry(prev, {
+          action: 'AUDIT_CHAIN_BROKEN',
+          details: `Integrity check failed at entry ${integrity.brokenAt}: ${integrity.reason}`,
+          level: 'error',
+          actor: 'System',
+          timestamp: new Date().toISOString(),
+        }));
+      }
+    } catch {
+      // Corrupt storage must not prevent the app from starting.
+    }
   }, []);
 
   // Opening Animation Timer (4 small squares -> center logo -> 4 words travel & converge -> slide up):
@@ -787,14 +913,14 @@ export default function App() {
 
       if (error) {
         setDataError("Could not load case history.");
-        addAuditEvent("FETCH_CASES_ERROR", `Patient ${patient.id}: ${error.message}`, "error");
+        addAuditEvent("FETCH_CASES_ERROR", `Patient ${patient.id}: ${error.message}`, "error", [], { patientId: patient.id });
       } else if (data) {
         setCases(data);
-        addAuditEvent("PATIENT_SELECTED", `${patient.name} (ID: ${patient.id})`, "info");
+        addAuditEvent("PATIENT_SELECTED", `${patient.name} (ID: ${patient.id})`, "info", [], { patientId: patient.id });
       }
     } catch (err) {
       setDataError("Network error loading case history.");
-      addAuditEvent("FETCH_CASES_NETWORK_ERR", err.message, "error");
+      addAuditEvent("FETCH_CASES_NETWORK_ERR", err.message, "error", [], { patientId: patient.id });
     }
     setLoadingData(false);
   };
@@ -821,11 +947,11 @@ export default function App() {
         `POSSIBLE DUPLICATE PATIENT\n\n${existing.reason}: #${String(existing.patient.id).padStart(4, '0')} ${existing.patient.name}.\n\nRegister as a new patient anyway?`
       );
       if (!proceed) {
-        addAuditEvent("DUPLICATE_REGISTRATION_BLOCKED", `${existing.reason} — matched #${existing.patient.id}`, "warn");
+        addAuditEvent("DUPLICATE_REGISTRATION_BLOCKED", `${existing.reason} — matched #${existing.patient.id}`, "warn", [], { patientId: existing.patient.id });
         showToast("Registration cancelled: an existing patient already matches.", "warning");
         return;
       }
-      addAuditEvent("DUPLICATE_REGISTRATION_OVERRIDE", `${existing.reason} — matched #${existing.patient.id}`, "warn");
+      addAuditEvent("DUPLICATE_REGISTRATION_OVERRIDE", `${existing.reason} — matched #${existing.patient.id}`, "warn", [], { patientId: existing.patient.id });
     }
 
     setIsSubmittingPatient(true);
@@ -885,7 +1011,7 @@ export default function App() {
       const created = persisted.data;
       if (created) setPatients([...patients, created]);
       showToast("Patient record successfully created.", "success");
-      addAuditEvent("REGISTER_PATIENT_OK", `${newRecord.name}${created ? ` (ID: ${created.id})` : ''}`, "success");
+      addAuditEvent("REGISTER_PATIENT_OK", `${newRecord.name}${created ? ` (ID: ${created.id})` : ''}`, "success", [], { patientId: created ? created.id : '' });
       // Spec: "The worker should then be able to immediately proceed from
       // registration into New Case, avoiding unnecessary navigation."
       if (created) {
@@ -913,7 +1039,7 @@ export default function App() {
         setPatients((prev) => prev.filter(p => p.id !== patientId));
         setView('dashboard');
         showToast("Patient record deleted.", "warning");
-        addAuditEvent("DELETE_PATIENT", `Patient ID: ${patientId}`, "warn");
+        addAuditEvent("DELETE_PATIENT", `Patient ID: ${patientId}`, "warn", [], { patientId });
       }
     } catch (err) {
       showToast("Failed to delete: " + err.message, "error");
@@ -933,7 +1059,9 @@ export default function App() {
       addAuditEvent(
         "CLINICAL_QA_RUN",
         `Step ${step} | ${result.status.toUpperCase()} | ${result.blocking.length} blocking, ${result.warnings.length} warnings`,
-        result.blocking.length > 0 ? "error" : result.warnings.length > 0 ? "warn" : "success"
+        result.blocking.length > 0 ? "error" : result.warnings.length > 0 ? "warn" : "success",
+        [],
+        { patientId: selectedPatient?.id }
       );
       const blocking = result.blockingMessages || [];
       if (blocking.length > 0) {
@@ -963,7 +1091,17 @@ export default function App() {
 
     recognition.onstart = () => {
       setIsRecording(true);
-      addAuditEvent("VOICE_RECORDING_START", "Microphone activated", "info");
+      addAuditEvent("VOICE_RECORDING_START", "Microphone activated", "info", [], { patientId: selectedPatient?.id });
+      // Spec's worked example begins "10:05 — Voice note captured".
+      setCaptureEvents((prev) => [
+        ...prev,
+        makeEvent(EVENT_TYPES.VOICE_CAPTURED, {
+          actor: authEmail || "Field Worker",
+          timestamp: new Date().toISOString(),
+          patientId: selectedPatient?.id,
+          details: "Microphone capture started",
+        }),
+      ]);
     };
     recognition.onresult = (event) => {
       let finalTranscript = "";
@@ -984,7 +1122,7 @@ export default function App() {
     if (file) {
       setImageFile(file);
       setImagePreview(URL.createObjectURL(file));
-      addAuditEvent("IMAGE_ATTACHED", file.name, "info");
+      addAuditEvent("IMAGE_ATTACHED", file.name, "info", [], { patientId: selectedPatient?.id });
       // Timeline event (spec: "Image captured")
       setCaptureEvents((prev) => [
         ...prev,
@@ -1002,9 +1140,10 @@ export default function App() {
   const extractCase = async () => {
     if (!inputText.trim() && !imageFile) return showToast("Please enter notes or upload an image.", "error");
     setLoadingAI(true);
+    setAiError("");
     const startedAt = new Date().toISOString();
     setCaseStartedAt(startedAt);
-    addAuditEvent("AI_PROCESSING_START", `Patient: ${selectedPatient?.name}`, "info");
+    addAuditEvent("AI_PROCESSING_START", `Patient: ${selectedPatient?.name}`, "info", [], { patientId: selectedPatient?.id });
 
     // Timeline events for what was captured (spec: voice note / notes / image per event).
     const newCaptureEvents = [];
@@ -1081,11 +1220,14 @@ export default function App() {
       // Generate prescription suggestions from report
       generatePrescriptionSuggestions(data.report);
       showToast("Clinical analysis synthesized successfully.", "success");
-      addAuditEvent("AI_PROCESSING_OK", `Extracted ${data.report?.confirmed?.length || 0} confirmed fields`, "success");
+      addAuditEvent("AI_PROCESSING_OK", `Extracted ${data.report?.confirmed?.length || 0} confirmed fields`, "success", [], { patientId: selectedPatient?.id });
       setCaseStep(2); // Move to AI Review step
     } catch (error) {
+      // Spec: an error must explain what happened and offer a next action, and must
+      // never cause captured information to disappear.
+      setAiError(error.message || "AI processing failed.");
       showToast("AI Processing Error: " + error.message, "error");
-      addAuditEvent("AI_PROCESSING_ERROR", error.message, "error");
+      addAuditEvent("AI_PROCESSING_ERROR", error.message, "error", [], { patientId: selectedPatient?.id });
     }
     setLoadingAI(false);
   };
@@ -1157,7 +1299,7 @@ export default function App() {
             "\n\nOverride and sign anyway? This override is written to the audit log."
         );
         if (!proceed) {
-          addAuditEvent("CLINICAL_QA_SIGN_BLOCKED", qa.blockingMessages.join(" | "), "error");
+          addAuditEvent("CLINICAL_QA_SIGN_BLOCKED", qa.blockingMessages.join(" | "), "error", [], { patientId: selectedPatient?.id });
           showToast("Signing stopped: resolve the blocking QA items or explicitly override.", "warning");
           return;
         }
@@ -1171,7 +1313,7 @@ export default function App() {
           return;
         }
         overrideReason = overrideReason.trim();
-        addAuditEvent("CLINICAL_QA_OVERRIDE", `Reason: ${overrideReason} | Blocked: ${qa.blockingMessages.join(" | ")}`, "warn");
+        addAuditEvent("CLINICAL_QA_OVERRIDE", `Reason: ${overrideReason} | Blocked: ${qa.blockingMessages.join(" | ")}`, "warn", [], { patientId: selectedPatient?.id });
       } else if (qa.warnings.length > 0) {
         addAuditEvent("CLINICAL_QA_ATTESTED", `Signed with ${qa.warnings.length} acknowledged warning(s)`, "warn");
       }
@@ -1187,9 +1329,12 @@ export default function App() {
         category: caseCategory,
         priority: casePriority,
         prescriptions: acceptedPrescriptions,
-        // Nothing is attributed to a doctor unless a doctor authored it (spec requirement).
+        // Hand-entered by the clinician as protocol drafts; attributed to nobody.
         prescriptions_author: '',
         prescriptions_author_role: '',
+        // Authorised prescriptions are separate: each carries its own doctor identity,
+        // date, patient/case and change history (spec requirement).
+        authorised_prescriptions: authorisedPrescriptions,
         doctor_suggestions: [],
         clinical_qa: qaAuditSnapshot(qa) ? { ...qaAuditSnapshot(qa), override_reason: overrideReason || null } : null,
         approved_at: new Date().toISOString(),
@@ -1219,6 +1364,8 @@ export default function App() {
 
     // Persist through the offline-aware path: online it posts, offline it queues locally,
     // so a signed encounter is never lost to a dropped connection.
+    // Note: a case persisted while offline has no server id yet, so its SYNCHRONISED
+    // timeline event is attached after upload (see runSync), not here.
     const persisted = await persistRecord('cases', newRecord);
     if (persisted.error) {
       showToast("Could not save the record: " + persisted.error, "error");
@@ -1236,16 +1383,38 @@ export default function App() {
     setSelectedDiagnosis("");
     setCaseStep(1);
     setPrescriptionSuggestions([]);
+    setAuthorisedPrescriptions([]);
+    setRxDrug("");
+    setRxDose("");
+    setNewFactField("");
+    setNewFactValue("");
     setCaptureEvents([]);
     setReviewEvents([]);
     setCaseStartedAt("");
     setView('patient');
     if (persisted.queued) {
       showToast("Encounter signed and saved on this device. It will upload automatically.", "warning");
-      addAuditEvent("CASE_APPROVED_OFFLINE", `Patient: ${selectedPatient.name} · queued for sync`, "warn");
+      addAuditEvent("CASE_APPROVED_OFFLINE", `Patient: ${selectedPatient.name} · queued for sync`, "warn", [], { patientId: selectedPatient.id });
     } else {
       showToast("Clinical encounter approved & signed to record.", "success");
-      addAuditEvent("CASE_APPROVED", `Patient: ${selectedPatient.name} | Priority: ${casePriority}`, "success");
+      addAuditEvent("CASE_APPROVED", `Patient: ${selectedPatient.name} | Priority: ${casePriority}`, "success", [], { patientId: selectedPatient.id, caseId: persisted.data?.id ?? "" });
+      if (persisted.data) {
+        // Spec's worked example ends "10:12 — Report approved".
+        appendCaseEvent(persisted.data.id, makeEvent(EVENT_TYPES.REPORT_APPROVED, {
+          actor: authEmail || "Field Worker",
+          timestamp: new Date().toISOString(),
+          caseId: persisted.data.id,
+          patientId: selectedPatient.id,
+          details: selectedDiagnosis || finalReport.summary?.slice(0, 40) || "",
+        }));
+        appendCaseEvent(persisted.data.id, makeEvent(EVENT_TYPES.CASE_SUBMITTED, {
+          actor: authEmail || "Field Worker",
+          timestamp: new Date().toISOString(),
+          caseId: persisted.data.id,
+          patientId: selectedPatient.id,
+          details: "Submitted to the record",
+        }));
+      }
     }
   };
 
@@ -1267,8 +1436,21 @@ export default function App() {
       addAuditEvent(
         "HUMAN_CORRECTION",
         `${before.field}: "${formatFactValue(before.value)}" -> "${newValue}" (AI value retained)`,
-        "warn"
+        "warn",
+        [{ field: before.field, from: formatFactValue(before.value), to: String(newValue) }],
+        { patientId: selectedPatient?.id }
       );
+      // Timeline line, e.g. "10:10 — Worker corrected temperature".
+      setReviewEvents((prev) => [
+        ...prev,
+        makeEvent(EVENT_TYPES.HUMAN_CORRECTION, {
+          actor: authEmail || "Field Worker",
+          timestamp: new Date().toISOString(),
+          patientId: selectedPatient?.id,
+          details: `${String(before.field).replace(/_/g, ' ')}: ${formatFactValue(before.value)} -> ${newValue}`,
+          data: { field: before.field, from: before.value, to: newValue },
+        }),
+      ]);
     }
     syncReviewToReport({ ...reviewModel, facts: updatedFacts });
   };
@@ -1279,7 +1461,29 @@ export default function App() {
       actor: authEmail || "Field Worker",
       timestamp: new Date().toISOString(),
     });
-    addAuditEvent("CONFLICT_RESOLVED", `${field} = "${formatFactValue(chosenValue)}" (human decision)`, "warn");
+    const conflict = reviewModel.conflicts.find((entry) => entry.field === field);
+    const rejectedValues = (conflict?.options || [])
+      .filter((option) => String(option.value) !== String(chosenValue))
+      .map((option) => option.value)
+      .join(" / ");
+    // Value-level record: what was chosen, and what it replaced (spec: previous → new value).
+    addAuditEvent(
+      "CONFLICT_RESOLVED",
+      `${field} = "${formatFactValue(chosenValue)}" (human decision)`,
+      "warn",
+      [{ field, from: rejectedValues, to: formatFactValue(chosenValue) }],
+      { patientId: selectedPatient?.id }
+    );
+    setReviewEvents((prev) => [
+      ...prev,
+      makeEvent(EVENT_TYPES.CONFLICT_RESOLVED, {
+        actor: authEmail || "Field Worker",
+        timestamp: new Date().toISOString(),
+        patientId: selectedPatient?.id,
+        details: `${String(field).replace(/_/g, ' ')} = ${formatFactValue(chosenValue)}`,
+        data: { field, chosen: chosenValue, rejected: rejectedValues },
+      }),
+    ]);
     syncReviewToReport({ ...reviewModel, conflicts: updatedConflicts });
   };
 
@@ -1292,7 +1496,7 @@ export default function App() {
       if (!error) {
         setCases((prev) => prev.filter(c => c.id !== caseId));
         showToast("Encounter record removed.", "warning");
-        addAuditEvent("DELETE_CASE", `Case ID: ${caseId}`, "warn");
+        addAuditEvent("DELETE_CASE", `Case ID: ${caseId}`, "warn", [], { caseId, patientId: selectedPatient?.id ?? "" });
       }
     } catch (err) {
       showToast("Failed to delete case: " + err.message, "error");
@@ -1315,6 +1519,43 @@ export default function App() {
   // Audit log filtering + facet lists for the filter controls.
   const filteredAuditLog = filterEvents(auditLog, auditFilters);
   const auditFacets = filterFacets(auditLog);
+
+  // Record refused access attempts. This runs as an effect, after the render that
+  // denied the view, so it cannot cause a render loop.
+  useEffect(() => {
+    if (view !== 'patient' && view !== 'capture' && view !== 'add_patient') return;
+    const needed = view === 'patient' ? 'view_patients' : view === 'capture' ? 'create_case' : 'create_patient';
+    if (checkAccess(currentRole, needed).allowed) return;
+    const what = view === 'patient'
+      ? `open a patient record${selectedPatient ? ` (${selectedPatient.name})` : ''}`
+      : view === 'capture'
+        ? 'start a new case'
+        : 'register a new patient';
+    recordDeniedAccess(needed, what, selectedPatient ? { patientId: selectedPatient.id } : {});
+  }, [view, currentRole, selectedPatient, recordDeniedAccess]);
+
+  // Review-screen derived values: the original source text and any AI claim whose quoted
+  // evidence could not be located in that source (a likely fabrication).
+  const captureTextSource = reviewModel ? (editedReport?.raw_source_text || inputText || "") : "";
+  const unsupportedFacts = reviewModel && Array.isArray(reviewModel.facts)
+    ? reviewModel.facts.filter((fact) => isUnsupported(fact))
+    : [];
+  // Only an authorised prescriber (a doctor) may author a prescription.
+  const canAuthorPrescriptionRecord = can(currentRole, 'create_prescription');
+
+  // Cases a doctor should look at: unresolved conflicts or blocking QA findings.
+  // Doctors are not a gate on every case, so ordinary cases are excluded.
+  const pendingReviewCases = cases.map((entry) => {
+    const details = entry.details || {};
+    const conflicts = Array.isArray(details.conflicts) ? details.conflicts.filter((c) => c && c.requires_resolution !== false) : [];
+    const blocked = details.clinical_qa?.status === 'blocked';
+    const reason = blocked
+      ? 'blocking QA findings'
+      : conflicts.length > 0
+        ? `${conflicts.length} unresolved conflict(s)`
+        : '';
+    return reason ? { id: entry.id, reason } : null;
+  }).filter(Boolean);
 
   // Patient profile derived data: provenance of the latest case and anything needing attention.
   const latestCase = cases.length > 0 ? cases[0] : null;
@@ -1413,6 +1654,15 @@ export default function App() {
               </div>
             )}
 
+            {syncBusy && (
+              <div className="flex items-center gap-3 p-3 border border-[#164634] bg-[#072118] rounded-[1px]">
+                <div className="w-4 h-4 border-2 border-[#164634] border-t-[#B5F5D1] rounded-full animate-spin shrink-0"></div>
+                <span className="text-[10px] font-mono text-[#A3D9BE] uppercase tracking-wider">
+                  Uploading — do not close this window
+                </span>
+              </div>
+            )}
+
             {empty ? (
               <p className="text-xs text-[#A3D9BE]">{empty}</p>
             ) : (
@@ -1453,7 +1703,7 @@ export default function App() {
                     op.status === SYNC_STATE.FAILED ? { ...op, status: SYNC_STATE.PENDING, attempts: 0, lastError: '' } : op
                   );
                   setSyncQueue(reset);
-                  addAuditEvent("SYNC_RETRY_RESET", `${failed.length} failed record(s) reset for retry`, "warn");
+                  addAuditEvent("SYNC_RETRY_RESET", `${failed.length} failed record(s) reset for retry`, "warn", [], {});
                   runSync(reset, "retry-reset");
                 }}
                 className="flex-1 bg-transparent border border-[#164634] text-[#A3D9BE] hover:text-[#D8FCE8] py-2.5 rounded-[2px] font-bold text-xs uppercase tracking-wider disabled:opacity-40 transition-colors"
@@ -2566,6 +2816,25 @@ export default function App() {
             </div>
           </div>
 
+          {/* Pending-review counter (spec names this empty state explicitly) */}
+          <div className="mb-8 p-4 bg-[#0b2b20] border border-[#164634] rounded-[2px] flex flex-col sm:flex-row sm:items-center justify-between gap-3">
+            <div>
+              <span className="block text-[10px] font-mono text-[#648E77] uppercase tracking-wider mb-1">Pending Reviews</span>
+              <span className="text-sm text-[#D8FCE8]">
+                {pendingReviewCases.length === 0
+                  ? 'No pending reviews.'
+                  : `${pendingReviewCases.length} case(s) awaiting clinical review.`}
+              </span>
+            </div>
+            {pendingReviewCases.length > 0 && (
+              <ul className="text-[10px] font-mono text-amber-200 space-y-0.5">
+                {pendingReviewCases.slice(0, 3).map((item) => (
+                  <li key={item.id}>#{String(item.id).padStart(4, '0')} — {item.reason}</li>
+                ))}
+              </ul>
+            )}
+          </div>
+
           {/* Patient Roster / Error / Empty States */}
           {loadingData ? (
             <div className="flex-grow flex flex-col items-center justify-center p-12 bg-[#0b2b20]/50 border border-[#164634] rounded-[2px]">
@@ -2645,6 +2914,28 @@ export default function App() {
   // VIEW: ADD PATIENT (MULTI-STEP REGISTRATION)
   // ==========================================
   if (view === 'add_patient') {
+    if (!requireAccess('create_patient')) {
+      return (
+        <div className="min-h-screen bg-[#072118] text-[#D8FCE8] flex flex-col justify-center items-center font-sans">
+          <Header />
+          <FullScreenMenu />
+          <Toast />
+          <div className="text-center px-6">
+            <h1 className="text-lg font-bold text-rose-300 mb-2">Not permitted to register patients</h1>
+            <p className="text-xs font-mono text-[#648E77] mb-6">
+              {roleLabel(currentRole)} cannot create patient records. This attempt has been
+              recorded in the audit log.
+            </p>
+            <button
+              onClick={() => setView('dashboard')}
+              className="text-xs font-mono text-[#B5F5D1] hover:text-white uppercase underline underline-offset-4 tracking-wider"
+            >
+              Return to Registry
+            </button>
+          </div>
+        </div>
+      );
+    }
     return (
       <div className="min-h-screen bg-[#072118] text-[#D8FCE8] flex flex-col font-sans selection:bg-[#B5F5D1] selection:text-[#072118]">
         <OfflineBanner />
@@ -2908,6 +3199,31 @@ export default function App() {
       return null;
     }
 
+    // Spec: "Access to patient information must be controlled according to the user's
+    // role and permissions." The refusal is recorded as an unauthorised access attempt.
+    if (!requireAccess('view_patients')) {
+      return (
+        <div className="min-h-screen bg-[#072118] text-[#D8FCE8] flex flex-col justify-center items-center font-sans">
+          <Header />
+          <FullScreenMenu />
+          <Toast />
+          <div className="text-center px-6">
+            <h1 className="text-lg font-bold text-rose-300 mb-2">Patient records are restricted</h1>
+            <p className="text-xs font-mono text-[#648E77] mb-6">
+              {roleLabel(currentRole)} does not have permission to view patient information.
+              This attempt has been recorded in the audit log.
+            </p>
+            <button
+              onClick={() => setView('dashboard')}
+              className="text-xs font-mono text-[#B5F5D1] hover:text-white uppercase underline underline-offset-4 tracking-wider"
+            >
+              Return to Registry
+            </button>
+          </div>
+        </div>
+      );
+    }
+
     return (
       <div className="min-h-screen bg-[#072118] text-[#D8FCE8] flex flex-col font-sans selection:bg-[#B5F5D1] selection:text-[#072118]">
         <OfflineBanner />
@@ -3034,7 +3350,7 @@ export default function App() {
             ) : cases.length === 0 ? (
               <div className="bg-[#0b2b20]/30 border border-[#164634]/50 rounded-[2px] p-10 flex flex-col items-center justify-center text-center">
                 <span className="text-3xl mb-3 opacity-50">🩺</span>
-                <span className="text-sm font-medium text-[#A3D9BE] mb-1">No clinical records found.</span>
+                <span className="text-sm font-medium text-[#A3D9BE] mb-1">No previous cases.</span>
                 <span className="text-xs text-[#648E77] max-w-xs">Start a new consultation to begin capturing this patient's medical history.</span>
               </div>
             ) : (
@@ -3111,6 +3427,11 @@ export default function App() {
                         )}
 
                         {/* Case timeline (spec: chronological record of how the report was produced) */}
+                        {(!Array.isArray(details.timeline) || details.timeline.length === 0) && (
+                          <div className="mb-4 text-[10px] font-mono text-[#648E77] italic">
+                            No events recorded for this case yet.
+                          </div>
+                        )}
                         {Array.isArray(details.timeline) && details.timeline.length > 0 && (
                           <div className="mb-4">
                             <button
@@ -3148,7 +3469,14 @@ export default function App() {
                                   ? { ...entry, details: { ...entry.details, doctor_suggestions: [...(entry.details?.doctor_suggestions || []), attributed.record] } }
                                   : entry);
                                 setCases(updated);
-                                addAuditEvent("DOCTOR_SUGGESTION_ADDED", `Case ${c.id}: ${text.trim().slice(0, 40)}`, "info");
+                                addAuditEvent("DOCTOR_SUGGESTION_ADDED", `Case ${c.id}: ${text.trim().slice(0, 40)}`, "info", [], { caseId: c.id, patientId: c.patient_id });
+                                appendCaseEvent(c.id, makeEvent(EVENT_TYPES.DOCTOR_SUGGESTION, {
+                                  actor: authEmail || "Dr. A. Sharma",
+                                  timestamp: new Date().toISOString(),
+                                  caseId: c.id,
+                                  patientId: c.patient_id,
+                                  details: text.trim().slice(0, 60),
+                                }));
                                 showToast("Doctor suggestion recorded against your identity.", "success");
                               }}
                               className="text-[10px] font-mono text-[#B5F5D1] hover:text-white uppercase tracking-wider"
@@ -3183,6 +3511,30 @@ export default function App() {
     if (!selectedPatient) {
       setView('dashboard');
       return null;
+    }
+
+    // Documenting an encounter is a clinical write: gate it and log the refusal.
+    if (!requireAccess('create_case')) {
+      return (
+        <div className="min-h-screen bg-[#072118] text-[#D8FCE8] flex flex-col justify-center items-center font-sans">
+          <Header />
+          <FullScreenMenu />
+          <Toast />
+          <div className="text-center px-6">
+            <h1 className="text-lg font-bold text-rose-300 mb-2">Not permitted to document cases</h1>
+            <p className="text-xs font-mono text-[#648E77] mb-6">
+              {roleLabel(currentRole)} cannot create a new case. This attempt has been recorded
+              in the audit log.
+            </p>
+            <button
+              onClick={() => setView('dashboard')}
+              className="text-xs font-mono text-[#B5F5D1] hover:text-white uppercase underline underline-offset-4 tracking-wider"
+            >
+              Return to Registry
+            </button>
+          </div>
+        </div>
+      );
     }
 
     return (
@@ -3272,6 +3624,31 @@ export default function App() {
                   </label>
                 </div>
 
+                {aiError && (
+                  <div className="p-4 border border-rose-500/40 bg-rose-950/20 rounded-[2px]">
+                    <h4 className="text-[10px] font-mono text-rose-300 uppercase mb-1.5">AI processing failed</h4>
+                    <p className="text-xs text-rose-200 mb-3">
+                      {aiError} Your notes and image are still here — nothing was lost.
+                    </p>
+                    <div className="flex gap-3">
+                      <button
+                        type="button"
+                        onClick={() => extractCase()}
+                        className="bg-rose-500/20 hover:bg-rose-500/30 border border-rose-500/40 text-rose-200 px-3 py-1.5 rounded-[1px] font-bold text-[10px] uppercase tracking-wider transition-colors"
+                      >
+                        Retry AI processing
+                      </button>
+                      <button
+                        type="button"
+                        onClick={() => setAiError("")}
+                        className="text-[10px] font-mono uppercase tracking-wider text-[#648E77] hover:text-[#D8FCE8] transition-colors"
+                      >
+                        Dismiss
+                      </button>
+                    </div>
+                  </div>
+                )}
+
                 <div className="mt-auto pt-6 border-t border-[#164634]">
                   <button
                     onClick={extractCase}
@@ -3308,8 +3685,9 @@ export default function App() {
                           {statusMeta(status).label}: {n}
                         </span>
                       ))}
-                    <span className="px-2 py-1 rounded-[1px] border border-[#164634] text-[#648E77]">
+                    <span className={`px-2 py-1 rounded-[1px] border ${unsupportedFacts.length > 0 ? 'border-rose-500/40 text-rose-300' : 'border-[#164634] text-[#648E77]'}`}>
                       Pending review: {pendingReviewItems(reviewModel).length}
+                      {unsupportedFacts.length > 0 ? ` • ${unsupportedFacts.length} unsupported claim(s)` : ''}
                     </span>
                   </div>
                 )}
@@ -3324,10 +3702,57 @@ export default function App() {
                   />
                 </div>
 
+                {/* Original source, shown alongside the structured output.
+                    Spec: display the voice transcript, uploaded note or entered text next
+                    to the information extracted from it, so the reviewer can compare. */}
+                <div className="bg-[#0b2b20] border border-[#164634] p-5 rounded-[2px] shadow-md">
+                  <label className="text-[10px] font-mono text-[#B5F5D1] uppercase tracking-widest block mb-2">
+                    Original Source (read-only)</label>
+                  <div className="space-y-3 max-h-64 overflow-y-auto custom-scrollbar pr-1">
+                    {captureTextSource && (
+                      <div className="bg-[#072118] border border-[#164634] rounded-[1px] p-3">
+                        <span className="block text-[9px] font-mono text-[#648E77] uppercase mb-1.5">Entered notes</span>
+                        <p className="text-xs font-mono text-[#A3D9BE] whitespace-pre-wrap leading-relaxed">{captureTextSource}</p>
+                      </div>
+                    )}
+                    {imagePreview && (
+                      <div className="bg-[#072118] border border-[#164634] rounded-[1px] p-3">
+                        <span className="block text-[9px] font-mono text-[#648E77] uppercase mb-1.5">Uploaded photograph</span>
+                        <img src={imagePreview} alt="Original uploaded note" className="w-full max-h-48 object-contain rounded-[1px] bg-black/30" />
+                      </div>
+                    )}
+                    {!captureTextSource && !imagePreview && (
+                      <p className="text-xs font-mono text-[#648E77] italic">
+                        No source is retained for this encounter, so the extracted values cannot be
+                        compared against their origin.
+                      </p>
+                    )}
+                  </div>
+                </div>
+
                 {/* Structured Entities */}
                 <div className="space-y-4">
                   <h3 className="text-xs font-mono text-[#648E77] uppercase tracking-widest border-b border-[#164634] pb-2">Extracted Entities</h3>
                   
+                  {unsupportedFacts.length > 0 && (
+                    // Spec: an AI claim that cannot be traced to the source must be flagged,
+                    // not silently accepted.
+                    <div className="mb-4 p-4 border border-rose-500/40 bg-rose-950/20 rounded-[2px]">
+                      <h4 className="text-[10px] font-mono text-rose-300 uppercase mb-2">
+                        Unsupported claims — not found in the source
+                      </h4>
+                      <ul className="space-y-1 text-xs text-rose-200">
+                        {unsupportedFacts.map((fact, i) => (
+                          <li key={i}>
+                            <span className="font-mono uppercase text-[10px] text-rose-300">{String(fact.field).replace(/_/g, ' ')}</span>
+                            {' — '}{formatFactValue(fact.value)}
+                            <span className="text-[10px] text-rose-400/80"> (quoted text does not appear in the source)</span>
+                          </li>
+                        ))}
+                      </ul>
+                    </div>
+                  )}
+
                   {reviewModel && reviewModel.facts && reviewModel.facts.length > 0 ? (
                     <div className="flex flex-col gap-3">
                       {reviewModel.facts.map((fact, idx) => {
@@ -3381,6 +3806,11 @@ export default function App() {
                                 <span className="text-[9px] font-mono uppercase text-[#648E77]">
                                   {fact.source === 'worker' ? 'Worker entered' : fact.source === 'ai' ? 'AI extracted' : fact.source}
                                 </span>
+                                {isUnsupported(fact) && (
+                                  <span className="text-[9px] font-mono uppercase px-1.5 py-0.5 rounded-[1px] border border-rose-500/40 text-rose-300">
+                                    Unsupported
+                                  </span>
+                                )}
                                 <button
                                   type="button"
                                   onClick={() => {
@@ -3388,7 +3818,13 @@ export default function App() {
                                       actor: authEmail || "Field Worker",
                                       timestamp: new Date().toISOString(),
                                     });
-                                    addAuditEvent("AI_OUTPUT_REJECTED", `${fact.field}: "${formatFactValue(fact.value)}" rejected`, "warn");
+                                    addAuditEvent("AI_OUTPUT_REJECTED", `${fact.field}: "${formatFactValue(fact.value)}" rejected`, "warn", [{ field: fact.field, from: formatFactValue(fact.value), to: "(rejected)" }], { patientId: selectedPatient?.id });
+                                    setReviewEvents((prev) => [...prev, makeEvent(EVENT_TYPES.AI_OUTPUT_REJECTED, {
+                                      actor: authEmail || "Field Worker",
+                                      timestamp: new Date().toISOString(),
+                                      patientId: selectedPatient?.id,
+                                      details: `${String(fact.field).replace(/_/g, ' ')}: "${formatFactValue(fact.value)}" rejected`,
+                                    })]);
                                     syncReviewToReport({ ...reviewModel, facts: updated });
                                   }}
                                   className="text-[9px] font-mono uppercase tracking-wider text-rose-400/70 hover:text-rose-300 transition-colors"
@@ -3442,6 +3878,55 @@ export default function App() {
                       </ul>
                     </div>
                   )}
+                  {/* Spec: the worker can add missing information, not only edit what the AI found. */}
+                  <div className="mt-4 p-4 border border-[#164634] bg-[#072118] rounded-[2px]">
+                    <h4 className="text-[10px] font-mono text-[#B5F5D1] uppercase mb-3">Add Missing Information</h4>
+                    <div className="flex flex-col sm:flex-row gap-2">
+                      <input
+                        className="flex-1 bg-[#0b2b20] border border-[#164634] text-[#D8FCE8] text-xs px-3 py-2 rounded-[1px] outline-none focus:border-[#B5F5D1]"
+                        placeholder="Field (e.g. blood_pressure)"
+                        value={newFactField}
+                        onChange={(e) => setNewFactField(e.target.value)}
+                      />
+                      <input
+                        className="flex-1 bg-[#0b2b20] border border-[#164634] text-[#D8FCE8] text-xs px-3 py-2 rounded-[1px] outline-none focus:border-[#B5F5D1]"
+                        placeholder="Value (e.g. 120/80)"
+                        value={newFactValue}
+                        onChange={(e) => setNewFactValue(e.target.value)}
+                      />
+                      <button
+                        type="button"
+                        onClick={() => {
+                          const field = newFactField.trim();
+                          const value = newFactValue.trim();
+                          if (!field || !value) return showToast("Enter both a field and a value.", "error");
+                          const added = {
+                            field,
+                            value,
+                            status: 'human_corrected',
+                            source: 'worker',
+                            evidence: [{ kind: 'worker_note', ref: authEmail || "Field Worker", quote: 'Added during review', label: 'human review' }],
+                            original_value: null,
+                            corrections: [{ from: null, to: value, actor: authEmail || "Field Worker", timestamp: new Date().toISOString() }],
+                          };
+                          setReviewEvents((prev) => [...prev, makeEvent(EVENT_TYPES.HUMAN_CORRECTION, {
+                            actor: authEmail || "Field Worker",
+                            timestamp: new Date().toISOString(),
+                            patientId: selectedPatient?.id,
+                            details: `added ${field}: ${value}`,
+                          })]);
+                          syncReviewToReport({ ...reviewModel, facts: [...reviewModel.facts, added] });
+                          addAuditEvent("FIELD_ADDED", `${field} = "${value}" (added by worker)`, "warn", [{ field, from: '', to: value }], { patientId: selectedPatient?.id });
+                          setNewFactField("");
+                          setNewFactValue("");
+                        }}
+                        className="bg-[#B5F5D1] hover:bg-[#c8fae0] text-[#072118] px-4 py-2 rounded-[1px] font-bold text-[10px] uppercase tracking-wider transition-colors"
+                      >
+                        Add Fact
+                      </button>
+                    </div>
+                  </div>
+
                   {reviewModel && reviewModel.conflicts && reviewModel.conflicts.length > 0 && (
                     <div className="mt-4 p-4 border border-amber-500/40 bg-amber-950/20 rounded-[2px]">
                       <h4 className="text-[10px] font-mono text-amber-300 uppercase mb-3 flex items-center gap-2">
@@ -3527,6 +4012,21 @@ export default function App() {
                   <p className="text-sm text-[#A3D9BE]">Finalize diagnosis and approve suggested prescriptions.</p>
                 </div>
 
+                {/* Spec: only authorised users may create prescriptions, AND the worker must
+                    understand why an action is unavailable rather than only not seeing it.
+                    Gated on authoring, not on canPrescribe: every role that can reach this step
+                    may already accept medication, so a canPrescribe check would never fire. */}
+                {!canAuthorPrescriptionRecord && (
+                  <div className="p-4 border border-amber-500/40 bg-amber-950/20 rounded-[2px]">
+                    <h4 className="text-[10px] font-mono text-amber-300 uppercase mb-1.5">Authoring a prescription requires a doctor</h4>
+                    <p className="text-xs text-amber-100">
+                      {roleLabel(currentRole)} may accept medication that a doctor has already authorised, but cannot
+                      author a new prescription. Any item accepted in this step is recorded as your entry, not as a
+                      doctor prescription. Ask a doctor to author one where clinical intervention is needed.
+                    </p>
+                  </div>
+                )}
+
                 <div className="grid grid-cols-1 md:grid-cols-2 gap-6">
                   {/* Left: Metadata */}
                   <div className="space-y-5">
@@ -3577,6 +4077,92 @@ export default function App() {
 
                   {/* Right: Prescriptions */}
                   <div className="bg-[#0b2b20] border border-[#164634] rounded-[2px] p-5 flex flex-col">
+                    {/* Spec: a prescription must carry medication, dosage, date, patient,
+                        case and the identity of the authorised person who created it, and
+                        must never look AI-generated. Only an authorised user may author one. */}
+                    {canAuthorPrescriptionRecord && (
+                      <div className="mb-5 pb-4 border-b border-[#164634]">
+                        <h4 className="text-[10px] font-mono text-[#B5F5D1] uppercase tracking-widest mb-2">
+                          Authorise a Prescription (doctor)
+                        </h4>
+                        <div className="grid grid-cols-2 gap-2 mb-2">
+                          <input
+                            className="bg-[#072118] border border-[#164634] text-[#D8FCE8] text-xs px-2 py-1.5 rounded-[1px] outline-none focus:border-[#B5F5D1]"
+                            placeholder="Medication"
+                            value={rxDrug}
+                            onChange={(e) => setRxDrug(e.target.value)}
+                          />
+                          <input
+                            className="bg-[#072118] border border-[#164634] text-[#D8FCE8] text-xs px-2 py-1.5 rounded-[1px] outline-none focus:border-[#B5F5D1]"
+                            placeholder="Dosage / instructions"
+                            value={rxDose}
+                            onChange={(e) => setRxDose(e.target.value)}
+                          />
+                        </div>
+                        <button
+                          type="button"
+                          onClick={() => {
+                            if (!requireAccess('create_prescription')) {
+                              recordDeniedAccess('create_prescription', 'authorise a prescription', { patientId: selectedPatient?.id });
+                              return;
+                            }
+                            const drug = rxDrug.trim();
+                            const dose = rxDose.trim();
+                            if (!drug) return showToast("Enter a medication.", "error");
+                            const attributed = attributeToAuthor(currentRole, authEmail || "Dr. A. Sharma", {
+                              drug,
+                              dose,
+                              route: 'Oral',
+                              prescribed_at: new Date().toISOString(),
+                              patient_id: selectedPatient?.id ?? "",
+                              case_patient_id: selectedPatient?.id ?? "",
+                              status: 'active',
+                              history: [{ at: new Date().toISOString(), by: authEmail || "Dr. A. Sharma", change: 'created' }],
+                            });
+                            if (!attributed.ok) return showToast(attributed.reason, "error");
+                            setAuthorisedPrescriptions((prev) => [...prev, attributed.record]);
+                            setReviewEvents((prev) => [...prev, makeEvent(EVENT_TYPES.PRESCRIPTION_CREATED, {
+                              actor: authEmail || "Dr. A. Sharma",
+                              timestamp: new Date().toISOString(),
+                              patientId: selectedPatient?.id,
+                              details: `authorised ${drug} ${dose}`,
+                            })]);
+                            addAuditEvent("PRESCRIPTION_AUTHORISED", `${drug} ${dose} by ${attributed.record.author}`, "success", [{ field: 'prescription', from: '', to: `${drug} ${dose}` }], { patientId: selectedPatient?.id });
+                            setRxDrug("");
+                            setRxDose("");
+                          }}
+                          className="w-full bg-[#164634] hover:bg-[#1b5642] text-[#D8FCE8] py-2 rounded-[1px] font-bold text-[10px] uppercase tracking-wider transition-colors"
+                        >
+                          Sign as {roleLabel(currentRole)}
+                        </button>
+                      </div>
+                    )}
+
+                    {authorisedPrescriptions.length > 0 && (
+                      <div className="mb-5 pb-4 border-b border-[#164634]">
+                        <h4 className="text-[10px] font-mono text-[#B5F5D1] uppercase tracking-widest mb-2">
+                          Authorised Prescriptions
+                        </h4>
+                        <div className="space-y-2">
+                          {authorisedPrescriptions.map((rx, i) => (
+                            <div key={i} className="bg-[#072118] border border-[#164634] rounded-[1px] p-2.5 text-[11px] font-mono">
+                              <div className="flex justify-between text-[#D8FCE8]">
+                                <span className="font-bold">{rx.drug}</span>
+                                <span className="text-[#A3D9BE]">{rx.dose}</span>
+                              </div>
+                              <div className="text-[9px] text-[#648E77] mt-1">
+                                {rx.author} ({roleLabel(rx.author_role)}) · {rx.prescribed_at ? new Date(rx.prescribed_at).toLocaleString() : ''} · patient #{rx.patient_id}
+                              </div>
+                              <div className="text-[9px] text-[#648E77]">
+                                status {rx.status} · not AI-generated {String(rx.generated_by_ai === false)}
+                                {rx.history?.length ? ` · ${rx.history.length} history entr${rx.history.length === 1 ? 'y' : 'ies'}` : ''}
+                              </div>
+                            </div>
+                          ))}
+                        </div>
+                      </div>
+                    )}
+
                     <h3 className="text-[10px] font-mono text-[#B5F5D1] uppercase tracking-widest mb-1 flex items-center gap-2">
                       <svg className="w-3.5 h-3.5" fill="none" viewBox="0 0 24 24" stroke="currentColor"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M19.428 15.428a2 2 0 00-1.022-.547l-2.387-.477a6 6 0 00-3.86.517l-.318.158a6 6 0 01-3.86.517L6.05 15.21a2 2 0 00-1.806.547M8 4h8l-1 1v5.172a2 2 0 00.586 1.414l5 5c1.26 1.26.367 3.414-1.415 3.414H4.828c-1.782 0-2.674-2.154-1.414-3.414l5-5A2 2 0 009 10.172V5L8 4z" /></svg>
                       Protocol Draft Medications
@@ -3586,9 +4172,10 @@ export default function App() {
                       Drafted from the standard protocol above. Accepting an item records it as your entry, not the AI's; it becomes an authorised doctor prescription only when a doctor signs it.
                     </p>
 
-                    {!canPrescribe(currentRole) && (
-                      <p className="text-[10px] font-mono text-rose-300 mb-3">
-                        {roleLabel(currentRole)} may not prescribe: review only.
+                    {!canAuthorPrescriptionRecord && (
+                      <p className="text-[10px] font-mono text-amber-300/90 mb-3">
+                        {roleLabel(currentRole)} may accept doctor-authorised medication but may not author a
+                        prescription.
                       </p>
                     )}
                     
@@ -3604,7 +4191,15 @@ export default function App() {
                                newArr[idx].accepted = !newArr[idx].accepted;
                                setPrescriptionSuggestions(newArr);
                                const verb = newArr[idx].accepted ? 'accepted' : 'unaccepted';
-                               addAuditEvent("PRESCRIPTION_ITEM", `${verb}: ${newArr[idx].drug} (draft, awaiting doctor authorisation)`, "info");
+                               addAuditEvent("PRESCRIPTION_ITEM", `${verb}: ${newArr[idx].drug} (draft, awaiting doctor authorisation)`, "info", [], { patientId: selectedPatient?.id });
+                               if (newArr[idx].accepted) {
+                                 setReviewEvents((prev) => [...prev, makeEvent(EVENT_TYPES.PRESCRIPTION_CREATED, {
+                                   actor: authEmail || "Field Worker",
+                                   timestamp: new Date().toISOString(),
+                                   patientId: selectedPatient?.id,
+                                   details: `${newArr[idx].drug} ${newArr[idx].dose}`,
+                                 })]);
+                               }
                              }}>
                           <div className={`mt-0.5 w-4 h-4 shrink-0 border flex items-center justify-center rounded-[1px] ${s.accepted ? 'bg-[#B5F5D1] border-[#B5F5D1] text-[#072118]' : 'border-[#648E77] text-transparent'}`}>
                             <svg className="w-3 h-3" fill="none" viewBox="0 0 24 24" stroke="currentColor"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={3} d="M5 13l4 4L19 7" /></svg>
@@ -3907,6 +4502,12 @@ export default function App() {
                       />
                       <input
                         className="bg-[#072118] border border-[#164634] text-[#D8FCE8] text-xs px-2 py-1.5 rounded-[1px] outline-none focus:border-[#B5F5D1]"
+                        placeholder="Case ID"
+                        value={auditFilters.caseId}
+                        onChange={(e) => setAuditFilters({ ...auditFilters, caseId: e.target.value })}
+                      />
+                      <input
+                        className="bg-[#072118] border border-[#164634] text-[#D8FCE8] text-xs px-2 py-1.5 rounded-[1px] outline-none focus:border-[#B5F5D1]"
                         placeholder="Action (e.g. HUMAN_CORRECTION)"
                         value={auditFilters.action}
                         onChange={(e) => setAuditFilters({ ...auditFilters, action: e.target.value })}
@@ -3979,6 +4580,10 @@ export default function App() {
                               {expanded && (
                                 <div className="px-3 pb-3 space-y-2 border-t border-[#164634]/60 pt-2">
                                   <div className="text-[10px] text-[#648E77]">{describeEvent(log)}</div>
+                                  <div className="flex flex-wrap gap-3 text-[10px] font-mono text-[#648E77]">
+                                    <span>patient: {log.patientId !== '' && log.patientId !== undefined ? `#${log.patientId}` : 'not applicable'}</span>
+                                    <span>case: {log.caseId !== '' && log.caseId !== undefined ? `#${log.caseId}` : 'not applicable'}</span>
+                                  </div>
                                   {hasChanges ? (
                                     <div className="space-y-1">
                                       {log.changes.map((change, changeIdx) => (

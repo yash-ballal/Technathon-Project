@@ -7,7 +7,7 @@
     "dev": "vite",
     "build": "vite build",
     "lint": "oxlint",
-    "test": "node --test src/clinicalQa.test.mjs src/patientRegistry.test.mjs src/clinicalReview.test.mjs src/auditLog.test.mjs src/syncQueue.test.mjs src/roles.test.mjs src/clinicalTimeline.test.mjs && node render-views.mjs",
+    "test": "node --test src/clinicalQa.test.mjs src/patientRegistry.test.mjs src/clinicalReview.test.mjs src/auditLog.test.mjs src/syncQueue.test.mjs src/roles.test.mjs src/clinicalTimeline.test.mjs src/integration.test.mjs && node render-views.mjs",
     "preview": "vite preview"
   },
   "dependencies": {
