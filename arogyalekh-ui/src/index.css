@@ -1,0 +1,157 @@
+@import "tailwindcss";
+@import "./App.css";
+
+@layer base {
+  :root {
+    --bg-deep-green: #072118;
+    --bg-forest-card: #0b2b20;
+    --bg-forest-elevated: #0f382a;
+    --border-forest: #164634;
+    --border-forest-subtle: rgba(181, 245, 209, 0.12);
+    --border-mint: rgba(181, 245, 209, 0.4);
+    
+    --text-mint-primary: #D8FCE8;
+    --text-mint-secondary: #648E77;
+    --text-mint-muted: #476d59;
+    --accent-mint: #B5F5D1;
+    --accent-mint-hover: #c8fae0;
+    --text-on-mint: #072118;
+  }
+
+  body {
+    font-family: 'Plus Jakarta Sans', system-ui, -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+    background-color: #072118;
+    color: #D8FCE8;
+    overflow-x: hidden;
+    scroll-behavior: smooth;
+  }
+}
+
+/* Custom smooth scrollbar */
+::-webkit-scrollbar {
+  width: 6px;
+  height: 6px;
+}
+::-webkit-scrollbar-track {
+  background: #072118;
+}
+::-webkit-scrollbar-thumb {
+  background: #164634;
+  border-radius: 9999px;
+}
+::-webkit-scrollbar-thumb:hover {
+  background: #25664d;
+}
+
+/* Choreography transition timing */
+.transition-choreography {
+  transition: all 0.9s cubic-bezier(0.16, 1, 0.3, 1);
+}
+
+.transition-choreography-fast {
+  transition: all 0.5s cubic-bezier(0.16, 1, 0.3, 1);
+}
+
+/* Keyframes for menu overlay & transitions */
+@keyframes overlayFadeIn {
+  from {
+    opacity: 0;
+  }
+  to {
+    opacity: 1;
+  }
+}
+
+@keyframes menuItemSlideIn {
+  from {
+    opacity: 0;
+    transform: translateY(20px);
+  }
+  to {
+    opacity: 1;
+    transform: translateY(0);
+  }
+}
+
+@keyframes revealSlow {
+  from {
+    opacity: 0;
+    transform: translateY(16px);
+  }
+  to {
+    opacity: 1;
+    transform: translateY(0);
+  }
+}
+
+@keyframes cornerFromTL {
+  from {
+    opacity: 0;
+    transform: translate(-40px, -40px);
+  }
+  to {
+    opacity: 1;
+    transform: translate(0, 0);
+  }
+}
+
+@keyframes cornerFromTR {
+  from {
+    opacity: 0;
+    transform: translate(40px, -40px);
+  }
+  to {
+    opacity: 1;
+    transform: translate(0, 0);
+  }
+}
+
+@keyframes cornerFromBL {
+  from {
+    opacity: 0;
+    transform: translate(-40px, 40px);
+  }
+  to {
+    opacity: 1;
+    transform: translate(0, 0);
+  }
+}
+
+@keyframes cornerFromBR {
+  from {
+    opacity: 0;
+    transform: translate(40px, 40px);
+  }
+  to {
+    opacity: 1;
+    transform: translate(0, 0);
+  }
+}
+
+.animate-menu-reveal {
+  animation: overlayFadeIn 0.25s ease-out forwards;
+}
+
+.animate-menu-item-in {
+  animation: menuItemSlideIn 0.45s cubic-bezier(0.16, 1, 0.3, 1) both;
+}
+
+.animate-reveal-slow {
+  animation: revealSlow 0.7s cubic-bezier(0.16, 1, 0.3, 1) forwards;
+}
+
+.animate-corner-tl {
+  animation: cornerFromTL 0.8s cubic-bezier(0.16, 1, 0.3, 1) forwards;
+}
+
+.animate-corner-tr {
+  animation: cornerFromTR 0.8s cubic-bezier(0.16, 1, 0.3, 1) forwards;
+}
+
+.animate-corner-bl {
+  animation: cornerFromBL 0.8s cubic-bezier(0.16, 1, 0.3, 1) forwards;
+}
+
+.animate-corner-br {
+  animation: cornerFromBR 0.8s cubic-bezier(0.16, 1, 0.3, 1) forwards;
+}
